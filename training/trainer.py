@@ -5,16 +5,20 @@
 
 数据准备 → 训练循环 → 测试评估：
 
-- **数据准备**：读取缓存（存在时）或重建数据集；按 70/15/15 划分
-  训练/验证/测试；只在训练集上拟合标准化参数；
+- **数据准备**：读取缓存（存在时）或重建数据集；**按时间顺序**划分
+  训练/验证/测试（前 70% / 中 15% / 后 15%，避免随机划分造成的时序泄漏）；
+  只在训练集上拟合标准化参数；
 - **训练循环**：Adam（lr=5e-4, weight_decay=1e-2 抑制过拟合）+
   风险感知损失；按验证损失保存最优模型；
 - **测试评估**：加载最优模型（而非最后一个 epoch），还原真实量纲后
-  施加物理约束（浓度非负、O2 ≤ 22%），输出全局/分气体指标与对比图。
+  施加物理约束（浓度非负、O2 ≤ 22%），输出全局/分气体的 MSE/MAE/R2，
+  并落盘 ``output/metrics.csv`` 与对比图。
 """
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 from typing import Dict
 
 import matplotlib.pyplot as plt
@@ -22,7 +26,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from matplotlib.ticker import MaxNLocator
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
 from config import BEST_MODEL_PATH, OUTPUT_DIR, PROCESSED_DATA_CACHE, TRAIN_DATA_FILE
 from dataset.coal_dataset import CoalMineDataset
@@ -60,18 +64,33 @@ class Trainer:
             self.dataset.save_processed_data(str(PROCESSED_DATA_CACHE))
 
         # 训练 70% / 验证 15% / 测试 15%
+        # 默认**按时间顺序**切分：序列本身按日期升序排列，用前段训练、后段测试才符合
+        # "预测未来"的设定。random 模式只用于复现旧口径、做泄漏对照（结果见 README）。
         total = len(self.dataset)
         train_size = int(self.config["train_ratio"] * total)
         val_size = int(self.config["val_ratio"] * total)
         test_size = total - train_size - val_size
+        self.split_mode = self.config.get("split_mode", "time")
 
-        self.train_ds, self.val_ds, self.test_ds = random_split(
-            self.dataset, [train_size, val_size, test_size],
-            generator=torch.Generator().manual_seed(self.config["seed"]),
-        )
+        if self.split_mode == "random":
+            perm = torch.randperm(
+                total, generator=torch.Generator().manual_seed(self.config["seed"])
+            ).tolist()
+            train_idx = perm[:train_size]
+            val_idx = perm[train_size:train_size + val_size]
+            test_idx = perm[train_size + val_size:]
+        else:
+            train_idx = list(range(0, train_size))
+            val_idx = list(range(train_size, train_size + val_size))
+            test_idx = list(range(train_size + val_size, total))
+        print(f"数据划分：{self.split_mode}（训练 {len(train_idx)} / 验证 {len(val_idx)} / 测试 {len(test_idx)}）")
+
+        self.train_ds = Subset(self.dataset, train_idx)
+        self.val_ds = Subset(self.dataset, val_idx)
+        self.test_ds = Subset(self.dataset, test_idx)
 
         # 只在训练集上拟合标准化参数
-        self.normalizer.fit(self.dataset, self.train_ds.indices)
+        self.normalizer.fit(self.dataset, train_idx)
 
     # ------------------------------------------------------------------
     # collate：DailyGraph → CollatedDay（归一化 + 张量化 + 上设备）
@@ -172,7 +191,7 @@ class Trainer:
     def evaluate(self, loader) -> None:
         """加载最优模型（Best Val Loss），在测试集上评估。"""
         print("\n" + "=" * 40)
-        print("🚀 正在测试最佳模型 (Best Val Loss Model)")
+        print("正在测试最佳模型 (Best Val Loss Model)")
         print("=" * 40)
 
         # 务必加载表现最好的那个模型，而不是最后一个 Epoch 的模型
@@ -198,12 +217,26 @@ class Trainer:
         all_preds = np.vstack(all_preds)
         all_tgts = np.vstack(all_tgts)
 
+        metric_rows = []
+
+        def _metrics(p, t) -> Dict[str, float]:
+            """一组预测的结果：MSE / MAE / R2（决定系数）。"""
+            mse = float(np.mean((p - t) ** 2))
+            mae = float(np.mean(np.abs(p - t)))
+            ss_res = float(np.sum((t - p) ** 2))
+            ss_tot = float(np.sum((t - t.mean()) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
+            return {"mse": mse, "mae": mae, "r2": r2}
+
         # 1. 全局指标
-        mse_global = np.mean((all_preds - all_tgts) ** 2)
-        mae_global = np.mean(np.abs(all_preds - all_tgts))
-        print(f"全局 MSE: {mse_global:.4f}")
-        print(f"全局 MAE: {mae_global:.4f}")
+        g = _metrics(all_preds, all_tgts)
+        print(f"全局 MSE: {g['mse']:.4f}")
+        print(f"全局 MAE: {g['mae']:.4f}")
+        print(f"全局 R2 : {g['r2']:.4f}")
         print("-" * 40)
+        metric_rows.append({"范围": "全局", "气体": "全部",
+                            "MSE": f"{g['mse']:.4f}", "MAE": f"{g['mae']:.4f}",
+                            "R2": f"{g['r2']:.4f}"})
 
         # 2. 分气体指标
         gas_names = ["氧气 (O2)", "一氧化碳 (CO)", "二氧化碳 (CO2)"]
@@ -212,15 +245,33 @@ class Trainer:
             p_gas = all_preds[:, col_indices]
             t_gas = all_tgts[:, col_indices]
 
-            mse_gas = np.mean((p_gas - t_gas) ** 2)
-            mae_gas = np.mean(np.abs(p_gas - t_gas))
-            print(f"📊 {gas_name} 预测结果:")
-            print(f"   MSE: {mse_gas:.4f}")
-            print(f"   MAE: {mae_gas:.4f}")
+            m = _metrics(p_gas, t_gas)
+            print(f"{gas_name} 预测结果:")
+            print(f"   MSE: {m['mse']:.4f}")
+            print(f"   MAE: {m['mae']:.4f}")
+            print(f"   R2 : {m['r2']:.4f}")
             print("-" * 20)
+            metric_rows.append({"范围": "分气体", "气体": gas_name,
+                                "MSE": f"{m['mse']:.4f}", "MAE": f"{m['mae']:.4f}",
+                                "R2": f"{m['r2']:.4f}"})
+
+        # 指标落盘，供论文/简历引用时溯源：
+        # output/ 是本次运行产物，results/ 随仓库提交便于他人复核（按划分方式分文件）
+        metrics_paths = [
+            OUTPUT_DIR / "metrics.csv",
+            Path(__file__).resolve().parents[1] / "results"
+            / f"metrics_{getattr(self, 'split_mode', 'time')}.csv",
+        ]
+        for metrics_path in metrics_paths:
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(metrics_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["范围", "气体", "MSE", "MAE", "R2"])
+                writer.writeheader()
+                writer.writerows(metric_rows)
+            print(f"\n指标已保存至: {metrics_path}")
 
         # 3. 抽样查看（前 2 个样本的所有节点）
-        print("\n🔍 预测值 vs 真实值 (前2个样本 - 所有节点):")
+        print("\n预测值 vs 真实值 (前2个样本 - 所有节点):")
         num_nodes = all_preds.shape[1] // 3
         for sample_idx in range(min(2, len(all_preds))):
             print(f"\n>>>>> 测试样本 {sample_idx + 1} <<<<<")
@@ -256,4 +307,4 @@ class Trainer:
 
         save_path = OUTPUT_DIR / "prediction_result_detailed.png"
         plt.savefig(save_path)
-        print(f"\n📈 可视化散点图已保存至: {save_path}")
+        print(f"\n可视化散点图已保存至: {save_path}")

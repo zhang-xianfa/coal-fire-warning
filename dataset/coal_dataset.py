@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import pickle
+from collections import Counter
 from datetime import datetime
 from typing import Dict, List, Tuple
 
@@ -123,19 +124,36 @@ class CoalMineDataset(Dataset):
         }
 
     def _build_sequences(self) -> None:
-        """滑动窗口切分：前 ``seq_len`` 天的图序列 → 第 8 天的目标向量。"""
+        """滑动窗口切分：前 ``seq_len`` 天的图序列 → 第 8 天的目标向量。
+
+        个别日期缺少测点记录（例如 2024-03-11 只有 5 个测点），
+        这类窗口的节点数与其他窗口不一致，会让目标张量变成不规则数组，
+        因此在窗口级别整条跳过，并打印跳过数量。
+        """
         print(f"Dataset: 正在构建序列 (Window={self.seq_len})...")
         sorted_dates = sorted(self.daily_graphs.keys())
         self.sequences, self.targets = [], []
 
+        # 以出现次数最多的节点数为准（正常日期应有全部测点）
+        node_counts = Counter(len(g.micro_features) for g in self.daily_graphs.values())
+        expected_nodes = node_counts.most_common(1)[0][0]
+
+        skipped = 0
         for i in range(len(sorted_dates) - self.seq_len):
             input_dates = sorted_dates[i : i + self.seq_len]
             target_date = sorted_dates[i + self.seq_len]
 
             input_seq = [self.daily_graphs[d] for d in input_dates]
+            target_graph = self.daily_graphs[target_date]
+
+            # 输入或目标节点数异常 → 整条窗口跳过
+            if len(target_graph.micro_features) != expected_nodes or any(
+                len(g.micro_features) != expected_nodes for g in input_seq
+            ):
+                skipped += 1
+                continue
 
             # 目标提取（节点顺序与 build_single_day_graph 中的排序一致）
-            target_graph = self.daily_graphs[target_date]
             target_matrix = np.array(target_graph.micro_features)  # [nodes, features]
 
             # 展平目标: [Node1_O2, Node1_CO, Node1_CO2, Node2_O2, ...]
@@ -144,7 +162,10 @@ class CoalMineDataset(Dataset):
             self.sequences.append(input_seq)
             self.targets.append(target_flat)
 
-        print(f"Dataset: 构建完成，共 {len(self.sequences)} 个样本。")
+        print(
+            f"Dataset: 构建完成，共 {len(self.sequences)} 个样本"
+            f"（节点数 != {expected_nodes} 的窗口跳过 {skipped} 个）。"
+        )
 
     # ------------------------------------------------------------------
     # 元信息与持久化

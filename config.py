@@ -61,6 +61,9 @@ TRAIN_CONFIG = {
     "epochs": 50,
     "weight_decay": 1e-2,  # L2 正则化，抑制过拟合
     # 数据划分：训练 70% / 验证 15% / 测试 15%
+    #   time   —— 按时间顺序切（前段训练、中段验证、后段测试），符合"预测未来"的设定
+    #   random —— 随机切分；时序数据上会让未来样本进入训练集（泄漏），仅用于口径对照
+    "split_mode": "time",
     "train_ratio": 0.7,
     "val_ratio": 0.15,
     "seed": 42,
